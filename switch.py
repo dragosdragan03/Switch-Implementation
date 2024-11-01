@@ -6,7 +6,6 @@ import threading
 import time
 from wrapper import recv_from_any_link, send_to_link, get_switch_mac, get_interface_name
 
-
 def parse_ethernet_header(data):
     # Unpack the header fields from the byte array
     #dest_mac, src_mac, ethertype = struct.unpack('!6s6sH', data[:14])
@@ -47,23 +46,28 @@ def parse_bpdu_packet(packet):
     return dest_mac, root_bridge_ID, sender_bridge_ID, sender_path_cost
     
 
-def send_bdpu_every_sec(own_bridge_id, root_bridge_id, sender_path_cost, interfaces, switch_config, switch_id):
-# def send_bdpu_every_sec():
-# if switch is root:
+def send_bdpu_every_sec(interfaces, switch_config, switch_id):
+
 # Send BPDU on all trunk ports with:
 #     mac_address (6 bytes)
 #     root_bridge_ID = own_bridge_ID (4 bytes)
 #     sender_bridge_ID = own_bridge_ID (4 bytes)
 #     sender_path_cost = 0  (4 bytes)
+    global own_bridge_id
+    global root_bridge_id
+    global root_path_cost
+    global root_port
+    global is_root_bridge
+    global switch_port
 
-    if own_bridge_id == root_bridge_id: # this means the switch is the root_bridge
-        while True:
+    while True:
+        if is_root_bridge:
             # # TODO Send BDPU every second if necessary
-            data = create_bpdu_package(root_bridge_id, own_bridge_id, sender_path_cost)
+            data = create_bpdu_package(root_bridge_id, own_bridge_id, root_path_cost)
             for i in interfaces:
                 if switch_config[switch_id][i] == 'T':
                     send_to_link(i, len(data), data)
-            time.sleep(1)
+        time.sleep(1)
 
 def identify_vlan_id(switch_id, interface):
     file_name = f'configs/switch{switch_id}.cfg'
@@ -116,31 +120,39 @@ def priority_switch(switch_id):
     with open(file_name, 'r') as file:
         return int(file.readline().strip())
     
-def receive_bpdu_package(data, root_bridge_ID, interface, own_bridge_id, switch_port, interfaces, switch_config, switch_id, root_port, root_path_cost):
+def receive_bpdu_package(data, interface, interfaces, switch_config, switch_id):
+    
+    global own_bridge_id
+    global root_bridge_id
+    global root_path_cost
+    global root_port
+    global is_root_bridge
+    global switch_port
     
     dest_mac, bpdu_root_bridge_ID, received_bridge_ID, received_path_cost = parse_bpdu_packet(data)
     # this means we have to update the root_bridge of the switch because we found one switch better than this
-    cop_root_bridge_id = root_bridge_ID
     
-    if bpdu_root_bridge_ID < root_bridge_ID:
-        root_bridge_ID = bpdu_root_bridge_ID # we update the root_bridge_id with the new switch; we should return to update it
+    if bpdu_root_bridge_ID < root_bridge_id:
+        root_bridge_id = bpdu_root_bridge_ID # we update the root_bridge_id with the new switch; we should return to update it
         root_path_cost = received_path_cost + 10 # we should return to update it
         root_port = interface # this is the interface were we received the bpdu package
 
-        if cop_root_bridge_id == own_bridge_id: # this means we were the root_bridge
+        if is_root_bridge:
             # i have to set all trunk port except the root_port on designated
             for i in interfaces:
                 if i != root_port and 'T' == switch_config[switch_id][i]:
                     switch_port[i] = 0 # i set the ports on blocking
+                    
+            is_root_bridge = False
         
         if switch_port[root_port] == 0:
             switch_port[root_port] = 1
             
         for i in interfaces:
             if 'T' == switch_config[switch_id][i]:
-                create_bpdu_package(root_bridge_ID, own_bridge_id, root_path_cost) # i send a BPDU package to all other ports
+                create_bpdu_package(root_bridge_id, own_bridge_id, root_path_cost) # i send a BPDU package to all other ports
     
-    elif bpdu_root_bridge_ID == root_bridge_ID: # this means they have the same priotity of the root
+    elif bpdu_root_bridge_ID == root_bridge_id: # this means they have the same priotity of the root
         if root_port == interface and received_path_cost + 10 < root_path_cost:
             root_path_cost = received_path_cost + 10
         elif interface != root_port:
@@ -152,15 +164,29 @@ def receive_bpdu_package(data, root_bridge_ID, interface, own_bridge_id, switch_
     #else:
         # discard the package
     
-    if own_bridge_id == root_bridge_ID:
+    if own_bridge_id == root_bridge_id:
         for i in interfaces:
             switch_port[i] = 1 
         
-        
-    return root_bridge_ID, root_path_cost, switch_port, root_port
-        
+
+own_bridge_id = None
+root_bridge_id = None
+root_path_cost = None
+root_port = None
+is_root_bridge = None
+switch_port = {}
 
 def main():
+    
+    # global switch_id
+    global own_bridge_id
+    global root_bridge_id
+    global root_path_cost
+    global root_port
+    global is_root_bridge
+    global switch_port
+    # global interfaces
+    
     # init returns the max interface number. Our interfaces
     # are 0, 1, 2, ..., init_ret value + 1
     switch_id = sys.argv[1] 
@@ -171,6 +197,7 @@ def main():
     root_bridge_id = own_bridge_id # at the beggining each switch has the root_bridge own id
     root_path_cost = 0
     root_port = -1
+    is_root_bridge = True
 
     num_interfaces = wrapper.init(sys.argv[2:]) # number of interfaces the switch has
     interfaces = range(0, num_interfaces)
@@ -179,8 +206,7 @@ def main():
 
     print("# Starting switch with id {}".format(switch_id), flush=True)
     print("[INFO] Switch MAC", ':'.join(f'{b:02x}' for b in get_switch_mac()))
-
-    switch_port = {}
+    
     # each port of the switch it will be or designated or blocked
     # a blocked port is marked with 0
     # a designated (listening) port will be 1
@@ -188,17 +214,12 @@ def main():
     switch_config[switch_id] = {}
     # Printing interface names
     for i in interfaces:
-        print(get_interface_name(i))
         switch_port[i] = 1 # i set every port on designated
         switch_config[switch_id][i] = identify_vlan_id(switch_id, i)
     
     # Create and start a new thread that deals with sending BDPU
-    t = threading.Thread(target=send_bdpu_every_sec, args=(own_bridge_id, root_bridge_id, root_path_cost, interfaces, switch_config, switch_id))
+    t = threading.Thread(target=send_bdpu_every_sec, args=(interfaces, switch_config, switch_id))
     t.start()
-
-    print(switch_config)
-    print("Portul {} de la switchul{} are VLAN idul{}".format(0, switch_id, switch_config[switch_id][0]))
-
 
     while True:
         # Note that data is of type bytes([...]).
@@ -232,17 +253,13 @@ def main():
         # interface - portul de pe care a fost primit pachetul
 
         if dest_mac == "01:80:c2:00:00:00":
-            print("A INTRAT IN IF")
-            root_bridge_id, root_path_cost, switch_port, root_port = receive_bpdu_package(data, root_bridge_id, interface, own_bridge_id, switch_port, interfaces, switch_config, switch_id, root_port, root_path_cost)
-            print("Received from interface {}".format(get_interface_name(interface)))
+            receive_bpdu_package(data, interface, interfaces, switch_config, switch_id)
         else: 
             mac_table[src_mac] = interface # asociez adresa mac cu portul
             if not dest_mac in mac_table: # it doesnt exist in mac_table so we have to send on broadcast on the same VLAN
                 forward_vlan_broadcast(vlan_id, interfaces, interface, switch_id, length, data, switch_config, switch_port)
             else:
                 forward_package(vlan_id, switch_id, mac_table[dest_mac], mac_table[src_mac], length, data, switch_config, switch_port)
-        # else: # this means i received a bpdu package
-
 
         # TODO: Implement VLAN support
    
